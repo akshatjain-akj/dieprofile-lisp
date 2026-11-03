@@ -8,13 +8,15 @@
 ;;;  It makes : 1. the round die circle (diameter from the first area)
 ;;;             2. every intermediate die profile with EXACTLY its area
 ;;;             3. (optional) a separate 3D solid of the whole process,
-;;;                each die section spaced along Z using the die angle.
+;;;                die sections a fixed distance apart along Z.
 ;;;
-;;;  Method   : every point of the final shape moves radially toward the
-;;;             round die by a fraction t; corners are rounded a little
-;;;             more at each stage; t is solved so the drawn polyline area
-;;;             equals the target (error < 0.000001 mm2).  AutoCAD's own
-;;;             area of every drawn polyline is read back and printed.
+;;;  Method   : profiles are built from the final shape OUTWARD.  In every
+;;;             direction from the die centre each profile moves toward the
+;;;             round die by a fraction t, corners are rounded a little more
+;;;             at each stage, and each profile is kept a small gap OUTSIDE
+;;;             the previous one (no overlap).  t is solved so the drawn
+;;;             polyline area equals the target (error < 0.000001 mm2).
+;;;             AutoCAD's own area of every polyline is read back and printed.
 ;;; ===================================================================
 
 (vl-load-com)
@@ -68,65 +70,123 @@
   (while (<= d (- pi)) (setq d (+ d (* 2.0 pi))))
   d)
 
-;; Matching point on the round die for every shape point (ray from the
-;; shape centroid g).  Angles are forced to increase steadily so the
-;; profiles never fold, even for Z-shapes with deep notches.
-(defun dp:circpts (pts g cc r / prev a un m fw bw)
-  (foreach p pts
-    (setq a (angle g p))
-    (if prev (setq a (+ prev (dp:normang (- a prev)))))
-    (setq un (cons a un) prev a))
-  (setq un (reverse un) m -1e99)
-  (foreach a un (setq m (max m a) fw (cons m fw)))
-  (setq fw (reverse fw) m 1e99)
-  (foreach a (reverse un) (setq m (min m a) bw (cons m bw)))
-  (mapcar '(lambda (f b) (polar cc (/ (+ f b) 2.0) r)) fw bw))
+;;; ------------------------------------------------------------------
+;;;  POLAR method (used whenever possible) - guarantees NO OVERLAP
+;;;  Every profile is described by its radius r(angle) from origin o,
+;;;  at n equal angles.  Each profile is forced to stay outside the
+;;;  previous (smaller) one by a small gap, so profiles never touch or
+;;;  cross, and the area is then solved exactly with that rule active.
+;;; ------------------------------------------------------------------
 
-;; closed moving-average over 2m+1 points
-(defun dp:box (pts m n / w ext lead tail sx sy res)
-  (setq w    (+ m m 1)
-        ext  (append (dp:lastn pts m) pts (dp:firstn pts m))
-        lead ext tail ext sx 0.0 sy 0.0)
-  (repeat w
-    (setq sx (+ sx (caar lead)) sy (+ sy (cadar lead)) lead (cdr lead)))
+;; Radius of a closed CCW polygon at n equal angles from origin o.
+;; Returns (a0 r0 r1 ... r[n-1]) or nil if some direction from o
+;; crosses the outline more than once ("not star-shaped" from o).
+(defun dp:polar-shape (pts o n / lst ok sum s a0 d segs p q k tau w u den r res)
+  (setq lst (append pts (list (car pts))) ok T sum 0.0
+        s (angle o (car pts)) a0 s)
+  (while (and ok (cdr lst))
+    (setq p (car lst) q (cadr lst)
+          d (dp:normang (- (angle o q) (angle o p))))
+    (if (< d -1e-9) (setq ok nil))
+    (setq segs (cons (list s (+ s d) p q) segs)
+          s (+ s d) sum (+ sum d) lst (cdr lst)))
+  (if (and ok (< (abs (- sum (* 2.0 pi))) 1e-6))
+    (progn
+      (setq segs (reverse segs) k 0)
+      (repeat n
+        (setq tau (+ a0 (* k (/ (* 2.0 pi) n))))
+        (while (and (cdr segs) (> tau (cadr (car segs)))) (setq segs (cdr segs)))
+        (setq p   (caddr (car segs)) q (cadddr (car segs))
+              w   (list (- (car q) (car p)) (- (cadr q) (cadr p)))
+              u   (list (cos tau) (sin tau))
+              den (- (* (car u) (cadr w)) (* (cadr u) (car w)))
+              r   (if (< (abs den) 1e-12)
+                    (distance o p)
+                    (/ (- (* (- (car p) (car o)) (cadr w)) (* (- (cadr p) (cadr o)) (car w)))
+                       den))
+              res (cons r res) k (1+ k)))
+      (cons a0 (reverse res)))))
+
+;; Same, for ANY shape (slots, hooks): radius of the OUTERMOST crossing in
+;; each direction.  The region inside it always contains the whole shape.
+(defun dp:polar-env (pts o n / lst segs p q w po k tau u den s r best res)
+  (setq lst (append pts (list (car pts))))
+  (while (cdr lst)
+    (setq p (car lst) q (cadr lst)
+          segs (cons (list (list (- (car q) (car p)) (- (cadr q) (cadr p)))
+                           (list (- (car p) (car o)) (- (cadr p) (cadr o))))
+                     segs)
+          lst (cdr lst)))
+  (setq k 0)
   (repeat n
-    (setq res (cons (list (/ sx w) (/ sy w)) res))
-    (if lead
-      (setq sx (+ sx (- (caar lead) (caar tail)))
-            sy (+ sy (- (cadar lead) (cadar tail)))
-            lead (cdr lead)))
+    (setq tau (* k (/ (* 2.0 pi) n)) u (list (cos tau) (sin tau)) best 0.0)
+    (foreach sg segs
+      (setq w (car sg) po (cadr sg)
+            den (- (* (car u) (cadr w)) (* (cadr u) (car w))))
+      (if (> (abs den) 1e-12)
+        (progn
+          (setq s (/ (- (* (car po) (cadr u)) (* (cadr po) (car u))) den)
+                r (/ (- (* (car po) (cadr w)) (* (cadr po) (car w))) den))
+          (if (and (>= s -1e-9) (<= s (+ 1.0 1e-9)) (> r best)) (setq best r)))))
+    (setq res (cons best res) k (1+ k)))
+  (cons 0.0 (reverse res)))
+
+;; distance from o to the round-die circle (centre cc, radius r) per angle
+(defun dp:Rpolar (o cc r n a0 / v vv k tau b res)
+  (setq v  (list (- (car cc) (car o)) (- (cadr cc) (cadr o)))
+        vv (+ (* (car v) (car v)) (* (cadr v) (cadr v))) k 0)
+  (repeat n
+    (setq tau (+ a0 (* k (/ (* 2.0 pi) n)))
+          b   (+ (* (cos tau) (car v)) (* (sin tau) (cadr v)))
+          res (cons (+ b (sqrt (max 0.0 (- (+ (* b b) (* r r)) vv)))) res)
+          k   (1+ k)))
+  (reverse res))
+
+;; exact area of the polygon through the n polar points
+(defun dp:parea (rs n / l s)
+  (setq l (append rs (list (car rs))) s 0.0)
+  (while (cdr l) (setq s (+ s (* (car l) (cadr l))) l (cdr l)))
+  (* 0.5 (sin (/ (* 2.0 pi) n)) s))
+
+;; closed moving average of a list of numbers, 3 passes
+(defun dp:box1 (l m n / w ext lead tail sm res)
+  (setq w (+ m m 1) ext (append (dp:lastn l m) l (dp:firstn l m))
+        lead ext tail ext sm 0.0)
+  (repeat w (setq sm (+ sm (car lead)) lead (cdr lead)))
+  (repeat n
+    (setq res (cons (/ sm w) res))
+    (if lead (setq sm (+ sm (- (car lead) (car tail))) lead (cdr lead)))
     (setq tail (cdr tail)))
   (reverse res))
 
-;; corner rounding (3 passes of moving average ~ gaussian)
-(defun dp:smooth (pts m n)
-  (if (>= m 1) (repeat 3 (setq pts (dp:box pts m n))))
-  pts)
+(defun dp:smooth1 (l m n)
+  (if (>= m 1) (repeat 3 (setq l (dp:box1 l m n))))
+  l)
 
-;; point-by-point blend  shape -> circle
-(defun dp:blend (ps cs tt)
-  (mapcar '(lambda (p c)
-             (list (+ (car p)  (* tt (- (car c)  (car p))))
-                   (+ (cadr p) (* tt (- (cadr c) (cadr p))))))
-          ps cs))
+;; profile radii at fraction tt:  between floor fl and the circle Rl
+(defun dp:pp (S1 S2 Rl fl tt)
+  (mapcar '(lambda (a b c f) (min c (max (+ a (* tt (- b a))) f))) S1 S2 Rl fl))
 
-;; find t in [0,1] so that area(blend) = target  (bisection)
-(defun dp:solve (ps cs target / lo hi mid)
+(defun dp:psolve (S1 S2 Rl fl target n / lo hi mid)
   (setq lo 0.0 hi 1.0)
   (repeat 50
     (setq mid (/ (+ lo hi) 2.0))
-    (if (< (dp:area (dp:blend ps cs mid)) target)
-      (setq lo mid)
-      (setq hi mid)))
+    (if (< (dp:parea (dp:pp S1 S2 Rl fl mid) n) target) (setq lo mid) (setq hi mid)))
   (/ (+ lo hi) 2.0))
 
-;; full profile for one target area -> list of points
-(defun dp:profile (P C target n rf / t0 m ps)
-  (setq t0 (dp:solve P C target)
+;; one stage: shape radii rs, circle radii Rl, previous (inner) profile
+;; prev with area prevA  ->  radii of new profile with area = target
+(defun dp:pstage (rs Rl prev prevA target n rf / gap fl k t0 m S1 S2)
+  (setq gap (* 0.25 (- (sqrt (/ target pi)) (sqrt (/ prevA pi)))) k 0)
+  (setq fl (mapcar '(lambda (a c) (min c (+ a gap))) prev Rl))
+  (while (and (< k 30) (>= (dp:parea fl n) target))     ; gap too big -> reduce
+    (setq gap (/ gap 2.0) k (1+ k)
+          fl  (mapcar '(lambda (a c) (min c (+ a gap))) prev Rl)))
+  (setq t0 (dp:psolve rs Rl Rl fl target n)
         m  (fix (+ 0.5 (* t0 n rf))))
   (if (> m (/ n 4)) (setq m (/ n 4)))
-  (setq ps (dp:smooth P m n))
-  (dp:blend ps C (dp:solve ps C target)))
+  (setq S1 (dp:smooth1 rs m n) S2 (dp:smooth1 Rl m n))
+  (dp:pp S1 S2 Rl fl (dp:psolve S1 S2 Rl fl target n)))
 
 ;;; ------------------------------------------------------------------
 ;;;  Drawing helpers
@@ -162,7 +222,8 @@
 (defun c:DIEPROFILE (/ *error* doc oldvars name sel shape lst s k bad
                        around afinal r rf n P G ap f scaled cent cc C
                        lay lay3 h stages i area pts e aact status rows ty
-                       do3d ang xoff z prevreq req secs before solid)
+                       pol tmp o a0 rs Rl angs prev prevA mids rr envA
+                       do3d dz xoff z secs before solid)
   (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
   (defun *error* (msg)
     (if (not (wcmatch (strcase msg) "*CANCEL*,*QUIT*,*EXIT*"))
@@ -240,11 +301,35 @@
 
   ;; ---- 6. build all stages (2D) ---------------------------------
   (princ "\nCalculating ...")
-  (setq C    (dp:circpts P G cc r)
-        lay  (strcat "DIE-" name)
+  (setq lay  (strcat "DIE-" name)
         lay3 (strcat "DIE-" name "-3D")
-        h    (/ r 10.0)
-        i    1)
+        h    (/ r 10.0))
+  ;; polar description of the shape, seen from die centre (or centroid)
+  (foreach cand (list cc G)
+    (if (and (null pol) (setq tmp (dp:polar-shape P cand n)))
+      (setq pol tmp o cand)))
+  (if (null pol)
+    (progn
+      (setq pol (dp:polar-env P cc n) o cc)
+      (princ (strcat "\n** NOTE: the shape has a slot/hook (some directions from the centre"
+                     "\n   cross its edge twice). The first profile will bridge over it."))))
+  (setq a0 (car pol) rs (cdr pol) Rl (dp:Rpolar o cc r n a0) k 0 angs nil)
+  (repeat n (setq angs (cons (+ a0 (* k (/ (* 2.0 pi) n))) angs) k (1+ k)))
+  (setq angs (reverse angs) envA (dp:parea rs n))
+  (if (vl-some '(lambda (a c) (> a c)) rs Rl)
+    (princ "\n** WARNING: part of the shape is OUTSIDE the round die circle!"))
+  ;; intermediate profiles, built from the final shape OUTWARD so each
+  ;; one is kept outside the previous one
+  (setq prev rs prevA envA mids nil i (1- (length lst)))
+  (while (>= i 2)
+    (setq area (nth (1- i) lst))
+    (if (> area prevA)
+      (setq rr    (dp:pstage rs Rl prev prevA area n rf)
+            prev  rr
+            prevA area
+            mids  (cons (cons i (mapcar '(lambda (x a) (polar o a x)) rr angs)) mids)))
+    (setq i (1- i)))
+  (setq i 1)
   ;; stages: list of (label area pts status) ; pts nil = round circle
   (foreach area lst
     (setq status nil pts nil)
@@ -258,11 +343,10 @@
          (setq e (dp:pline P lay 0.0) aact (vlax-curve-getArea e)
                status "final shape (scaled copy drawn)")
          (setq aact (vlax-curve-getArea shape) status "final shape (selected)")))
-      ((<= area ap)
+      ((null (setq pts (cdr (assoc i mids))))
        (setq status "SKIPPED: not bigger than final shape" aact nil))
       (T
-       (setq pts  (dp:profile P C area n rf)
-             e    (dp:pline pts lay 0.0)
+       (setq e    (dp:pline pts lay 0.0)
              aact (vlax-curve-getArea e)
              status "drawn")))
     (setq stages (cons (list (strcat name "-" (itoa i)) area pts status aact) stages)
@@ -294,24 +378,20 @@
   (if (/= do3d "No")
     (progn
       (initget 6)
-      (setq ang (getreal "\nDie included angle in degrees (sets the length between dies) <16>: "))
-      (if (null ang) (setq ang 16.0))
-      (setq xoff (* 7.0 r) z 0.0 prevreq nil secs nil)
+      (setq dz (getreal "\nDistance between die sections in 3D <5>: "))
+      (if (null dz) (setq dz 5.0))
+      (setq xoff (* 7.0 r) z nil secs nil)
       (foreach st stages
         (if (wcmatch (cadddr st) "drawn,round*,final*")
           (progn
-            (setq req (sqrt (/ (cadr st) pi)))          ; equivalent radius
-            (if prevreq
-              (setq z (+ z (/ (- prevreq req) (/ (sin (/ (* ang pi) 360.0))
-                                                 (cos (/ (* ang pi) 360.0)))))))
-            (setq prevreq req)
+            (setq z (if z (+ z dz) 0.0))
             (setq secs (cons (if (caddr st)
                                (dp:pline (dp:shift (caddr st) xoff) lay3 z)
                                (dp:circle (list (+ (car cc) xoff) (cadr cc)) r lay3 z))
                              secs)))))
       (setq secs (reverse secs))
       (dp:text (list (+ (car cc) xoff (- r)) (- (cadr cc) r (* 2.5 h))) (* 1.4 h)
-               (strcat name " 3D  (" (rtos ang 2 1) " deg, length " (rtos z 2 2) ")") lay3)
+               (strcat name " 3D  (section spacing " (rtos dz 2 2) ")") lay3)
       ;; loft through all sections, keep the section rings visible
       (setq oldvars (list (cons "CMDECHO" (getvar "CMDECHO"))
                           (cons "DELOBJ"  (getvar "DELOBJ"))
